@@ -132,6 +132,12 @@ func baseEvent(action, service, resource, resourceID string, before, after map[s
 	return e
 }
 
+// NewEvent builds one full wire event; exported for integrations that capture
+// operations themselves (e.g. database callbacks in auditgorm).
+func NewEvent(action, service, resource, resourceID string, before, after map[string]any, profile EventProfile) map[string]any {
+	return baseEvent(action, service, resource, resourceID, before, after, profile)
+}
+
 // chunkByBudget walks rows in order, flushing a chunk when adding the next row
 // would exceed the per-event budget (+16 bytes row overhead, PHP parity).
 // Key-preserving: callers rebuild list- or map-shaped "rows" as needed.
