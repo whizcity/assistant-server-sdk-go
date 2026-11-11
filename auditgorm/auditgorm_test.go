@@ -1,6 +1,7 @@
 package auditgorm
 
 import (
+	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -8,9 +9,10 @@ import (
 	"testing"
 	"time"
 
-	gorm "github.com/jinzhu/gorm"
-	_ "github.com/mattn/go-sqlite3"
 	as "github.com/whizcity/assistant-server-sdk-go"
+	"gorm.io/driver/sqlite"
+	"gorm.io/gorm"
+	"gorm.io/gorm/logger"
 )
 
 // captured server that records {"events":[...]} envelopes.
@@ -66,32 +68,40 @@ func itoa(n int) string {
 }
 
 type subject struct {
-	ID    uint64
-	Title *string
-	State *string
+	ID        uint64
+	Title     *string
+	State     *string
+	UpdatedAt time.Time
 }
 
 func (subject) TableName() string { return "subjects" }
 
 func newAuditedDB(t *testing.T, e *eventsServer, include func(string) bool, operatorID string) *gorm.DB {
 	t.Helper()
-	qdb, err := gorm.Open("sqlite3", "file::memory:?mode=memory&cache=private")
+	qdb, err := gorm.Open(sqlite.Open("file::memory:?mode=memory&cache=private"), &gorm.Config{
+		Logger: logger.Default.LogMode(logger.Silent),
+	})
 	if err != nil {
 		t.Fatalf("sqlite open: %v", err)
 	}
-	t.Cleanup(func() { _ = qdb.Close() })
-	if err = qdb.DB().Ping(); err != nil {
+	sqlDB, err := qdb.DB()
+	if err != nil {
+		t.Fatalf("sql db: %v", err)
+	}
+	sqlDB.SetMaxOpenConns(1)
+	t.Cleanup(func() { _ = sqlDB.Close() })
+	if err = sqlDB.Ping(); err != nil {
 		t.Fatalf("ping: %v", err)
 	}
 	for _, ddl := range []string{
-		"CREATE TABLE subjects (id INTEGER PRIMARY KEY AUTOINCREMENT, title TEXT, state TEXT, created_at DATETIME)",
+		"CREATE TABLE subjects (id INTEGER PRIMARY KEY AUTOINCREMENT, title TEXT, state TEXT, created_at DATETIME, updated_at DATETIME)",
 	} {
 		if err = qdb.Exec(ddl).Error; err != nil {
 			t.Fatalf("ddl %q: %v", ddl, err)
 		}
 	}
 	client := as.NewClient(as.ClientConfig{Address: e.srv.URL, AppID: "t", Secret: "s"})
-	profile := func() as.EventProfile {
+	profile := func(context.Context) as.EventProfile {
 		return as.EventProfile{Service: "parking", OperatorID: operatorID, OperatorName: "张三"}
 	}
 	if err = Register(qdb, client, profile, include); err != nil {
@@ -246,6 +256,192 @@ func TestMassDeleteMergesImagesPerRow(t *testing.T) {
 	}
 }
 
+func TestInstanceDeleteCapturesImage(t *testing.T) {
+	e := newEventsServer(t)
+	qdb := newAuditedDB(t, e, nil, "9")
+	row := &subject{Title: strp("订单一"), State: strp("paid")}
+	if err := qdb.Create(row).Error; err != nil {
+		t.Fatal(err)
+	}
+	waitDrained(t, time.Second)
+	if err := qdb.Delete(row).Error; err != nil {
+		t.Fatal(err)
+	}
+	waitDrained(t, 2*time.Second)
+
+	var deletes []map[string]any
+	for _, ev := range e.all() {
+		if ev["action"] == "delete" {
+			deletes = append(deletes, ev)
+		}
+	}
+	if len(deletes) != 1 {
+		t.Fatalf("expected one delete event, got %d", len(deletes))
+	}
+	if got := deletes[0]["resource_id"]; got != "1" {
+		t.Errorf("resource_id = %v", got)
+	}
+	before := deletes[0]["before"].(map[string]any)
+	if before["title"] != "订单一" || before["state"] != "paid" {
+		t.Errorf("before image wrong: %+v", before)
+	}
+	if _, hasID := before["id"]; hasID {
+		t.Errorf("primary key must not appear in before image: %+v", before)
+	}
+}
+
+func TestModelUpdatesMapCapturesOnlyChangedFields(t *testing.T) {
+	e := newEventsServer(t)
+	qdb := newAuditedDB(t, e, nil, "9")
+	row := &subject{Title: strp("订单一"), State: strp("draft")}
+	if err := qdb.Create(row).Error; err != nil {
+		t.Fatal(err)
+	}
+	waitDrained(t, time.Second)
+
+	if err := qdb.Model(row).Updates(map[string]any{"state": "draft"}).Error; err != nil {
+		t.Fatal(err)
+	}
+	waitDrained(t, time.Second)
+	if updates := countAction(e.all(), "update"); updates != 0 {
+		t.Fatalf("no-op update must stay silent, got %d", updates)
+	}
+
+	if err := qdb.Model(row).Updates(map[string]any{"state": "paid"}).Error; err != nil {
+		t.Fatal(err)
+	}
+	waitDrained(t, 2*time.Second)
+	var updates []map[string]any
+	for _, ev := range e.all() {
+		if ev["action"] == "update" {
+			updates = append(updates, ev)
+		}
+	}
+	if len(updates) != 1 {
+		t.Fatalf("expected one update event, got %d", len(updates))
+	}
+	after := updates[0]["after"].(map[string]any)
+	if after["state"] != "paid" {
+		t.Errorf("after wrong: %+v", after)
+	}
+	if _, hasTitle := after["title"]; hasTitle {
+		t.Errorf("unchanged columns must not be logged: %+v", after)
+	}
+}
+
+func TestStructUpdatesSkipsZeroFields(t *testing.T) {
+	e := newEventsServer(t)
+	qdb := newAuditedDB(t, e, nil, "9")
+	row := &subject{Title: strp("订单一"), State: strp("draft")}
+	if err := qdb.Create(row).Error; err != nil {
+		t.Fatal(err)
+	}
+	waitDrained(t, time.Second)
+
+	if err := qdb.Model(row).Updates(&subject{State: strp("paid")}).Error; err != nil {
+		t.Fatal(err)
+	}
+	waitDrained(t, 2*time.Second)
+
+	var updates []map[string]any
+	for _, ev := range e.all() {
+		if ev["action"] == "update" {
+			updates = append(updates, ev)
+		}
+	}
+	if len(updates) != 1 {
+		t.Fatalf("expected one update event, got %d", len(updates))
+	}
+	after := updates[0]["after"].(map[string]any)
+	if after["state"] != "paid" {
+		t.Errorf("after wrong: %+v", after)
+	}
+	if _, hasTitle := after["title"]; hasTitle {
+		t.Errorf("zero-valued fields are not written by Updates and must not be logged: %+v", after)
+	}
+}
+
+func TestTableUpdatesMapCapturesRowsWithoutModelSchema(t *testing.T) {
+	e := newEventsServer(t)
+	qdb := newAuditedDB(t, e, nil, "9")
+	row := &subject{Title: strp("订单一"), State: strp("draft")}
+	if err := qdb.Create(row).Error; err != nil {
+		t.Fatal(err)
+	}
+	waitDrained(t, time.Second)
+
+	if err := qdb.Table("subjects").Where("id = ?", row.ID).Updates(map[string]any{"state": "paid"}).Error; err != nil {
+		t.Fatal(err)
+	}
+	waitDrained(t, 2*time.Second)
+
+	var updates []map[string]any
+	for _, ev := range e.all() {
+		if ev["action"] == "update" {
+			updates = append(updates, ev)
+		}
+	}
+	if len(updates) != 1 {
+		t.Fatalf("expected one update event, got %d", len(updates))
+	}
+	if got := updates[0]["resource_id"]; got != "1" {
+		t.Errorf("resource_id = %v", got)
+	}
+	after := updates[0]["after"].(map[string]any)
+	if after["state"] != "paid" {
+		t.Errorf("after wrong: %+v", after)
+	}
+}
+
+type statePatch struct {
+	State *string
+}
+
+func TestTableUpdatesPartialStructCapturesOnlyProvidedFields(t *testing.T) {
+	e := newEventsServer(t)
+	qdb := newAuditedDB(t, e, nil, "9")
+	row := &subject{Title: strp("订单一"), State: strp("draft")}
+	if err := qdb.Create(row).Error; err != nil {
+		t.Fatal(err)
+	}
+	waitDrained(t, time.Second)
+
+	if err := qdb.Table("subjects").Where("id = ?", row.ID).Updates(&statePatch{State: strp("paid")}).Error; err != nil {
+		t.Fatal(err)
+	}
+	waitDrained(t, 2*time.Second)
+
+	var updates []map[string]any
+	for _, ev := range e.all() {
+		if ev["action"] == "update" {
+			updates = append(updates, ev)
+		}
+	}
+	if len(updates) != 1 {
+		t.Fatalf("expected one update event, got %d", len(updates))
+	}
+	if got := updates[0]["resource_id"]; got != "1" {
+		t.Errorf("resource_id = %v", got)
+	}
+	after := updates[0]["after"].(map[string]any)
+	if after["state"] != "paid" {
+		t.Errorf("after wrong: %+v", after)
+	}
+	if _, hasTitle := after["title"]; hasTitle {
+		t.Errorf("partial struct must only log provided fields: %+v", after)
+	}
+}
+
+func countAction(events []map[string]any, action string) int {
+	n := 0
+	for _, ev := range events {
+		if ev["action"] == action {
+			n++
+		}
+	}
+	return n
+}
+
 func TestEmptyOperatorProfileSkipsAuditing(t *testing.T) {
 	e := newEventsServer(t)
 	qdb := newAuditedDB(t, e, nil, "")
@@ -270,7 +466,9 @@ func TestIncludeFilterBlocksTables(t *testing.T) {
 	}
 }
 
-func insert(qdb *gorm.DB, row subject) { qdb.Exec("INSERT INTO subjects (id,title,state) VALUES (?,?,?)", row.ID, *row.Title, *row.State) }
+func insert(qdb *gorm.DB, row subject) {
+	qdb.Exec("INSERT INTO subjects (id,title,state) VALUES (?,?,?)", row.ID, *row.Title, *row.State)
+}
 
 func updateState(qdb *gorm.DB) { qdb.Model(&subject{}).Exec("UPDATE subjects SET state=? ", "draft") }
 

@@ -43,7 +43,11 @@ func NewClient(cfg ClientConfig) *Client {
 	if cfg.HTTP != nil {
 		c.http = cfg.HTTP
 	} else {
-		c.http = &http.Client{Timeout: cfg.Timeout}
+		timeout := cfg.Timeout
+		if timeout <= 0 {
+			timeout = 20 * time.Second
+		}
+		c.http = &http.Client{Timeout: timeout}
 	}
 	return c
 }
@@ -111,9 +115,23 @@ func (c *Client) Sync(event map[string]any) *Result {
 	return c.Request("POST", "/api/v1/audit/logs", event)
 }
 
-// SyncBatch posts the {"events":[...]} envelope (1..500 events per server
-// contract; duplicate event_ids rejected server-side).
+// SyncBatch posts the {"events":[...]} envelope. The server accepts at most
+// 500 events per call, so larger slices are sent as consecutive batches; the
+// first failing batch stops the loop and is returned.
 func (c *Client) SyncBatch(events []map[string]any) *Result {
+	if len(events) == 0 {
+		return &Result{Code: "VALIDATION_ERROR", Message: "events must not be empty"}
+	}
+	for len(events) > 500 {
+		if r := c.syncBatch(events[:500]); !r.Success() {
+			return r
+		}
+		events = events[500:]
+	}
+	return c.syncBatch(events)
+}
+
+func (c *Client) syncBatch(events []map[string]any) *Result {
 	return c.Request("POST", "/api/v1/audit/logs/batch", map[string]any{"events": events})
 }
 

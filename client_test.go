@@ -1,6 +1,7 @@
 package assistantserver
 
 import (
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -66,6 +67,38 @@ func TestRequestGetFoldsParamsIntoSignedQuery(t *testing.T) {
 	}
 	if sig := HMACSHA256Hex(testSecret, cap.canonical(testApp)); sig != cap.header(HeaderSignature) {
 		t.Errorf("signature must cover the query")
+	}
+}
+
+func TestSyncBatchSplitsAt500AndRejectsEmpty(t *testing.T) {
+	var sizes []int
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var body struct {
+			Events []map[string]any `json:"events"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Errorf("decode batch: %v", err)
+		}
+		sizes = append(sizes, len(body.Events))
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"accepted":1,"failed":0}`))
+	}))
+	t.Cleanup(srv.Close)
+
+	c := NewClient(ClientConfig{Address: srv.URL, AppID: testApp, Secret: postSecret})
+	events := make([]map[string]any, 501)
+	for i := range events {
+		events[i] = map[string]any{"event_id": NewULID()}
+	}
+
+	if r := c.SyncBatch(events); !r.Success() {
+		t.Fatalf("batch must succeed, got %+v", r)
+	}
+	if len(sizes) != 2 || sizes[0] != 500 || sizes[1] != 1 {
+		t.Errorf("want batches [500 1], got %v", sizes)
+	}
+	if r := c.SyncBatch(nil); r.Success() || r.Code != "VALIDATION_ERROR" {
+		t.Errorf("empty batch must be rejected locally, got %+v", r)
 	}
 }
 
