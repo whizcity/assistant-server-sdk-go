@@ -81,11 +81,13 @@ import (
 
 type profileKey struct{}
 
-err := auditgorm.Register(db, client, func(ctx context.Context) as.EventProfile {
+err := auditgorm.Register(db, recorder, func(ctx context.Context) as.EventProfile {
     p, _ := ctx.Value(profileKey{}).(as.EventProfile)
     return p
 }, nil) // 第三个参数可传 func(table string) bool 过滤表
 ```
+
+`recorder` 的签名是 `func(tx *gorm.DB, events []map[string]any) error`。它在业务写入的**同一事务**内同步调用，通常把事件写进本地 `audit_logs` 出站表；返回错误会让业务写入回滚。SDK 不负责 HTTP 同步/重试，业务侧用定时任务读取未同步行并调用 `client.SyncBatch`，成功后标记，失败按自己的策略退避。`audit_logs` 表本身不会被自动审计。
 
 `Register` 的 profile 从 `tx.Statement.Context` 取上下文；**写操作必须带上请求 context**，否则 `OperatorID` 为空，事件会被静默跳过：
 
@@ -106,7 +108,7 @@ db.Where("id IN ?", ids).Delete(&Row{})
 
 不捕获（需手动 `as.NewEvent` 或 `Merge*`）：raw `Exec`、目标为 map 的 `Create`、无条件的全表写。
 
-事件在 SQL 成功后异步 POST（goroutine），不阻塞业务，也没有重试/本地持久化；进程退出或网络失败会丢事件。事件在事务提交前发出，外层事务回滚时仍可能已经上报。需要 PHP SDK 那种本地 `audit_logs` 队列语义时，应在业务侧加 outbox，而不是依赖 goroutine。
+事件在 SQL 成功后、事务提交前交给 recorder，因此本地审计行和业务写入同生共死；HTTP 上报由业务侧的定时同步任务完成，失败的行保留在本地重试。
 
 ## 响应语义
 

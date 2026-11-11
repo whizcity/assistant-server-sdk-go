@@ -7,8 +7,9 @@
 // SQL and Create calls whose destination is a map.
 //
 // Before-images are read through the current transaction's ConnPool. Events
-// are POSTed asynchronously (goroutine) after the SQL succeeds, so a gorm call
-// never waits for HTTP; failures stay silent unless the client has DebugLog.
+// are handed to the recorder synchronously inside the same transaction: the
+// PHP SDK writes its local audit_logs queue this way, and a recorder error
+// aborts the business write. Sync/retry is the application's job.
 package auditgorm
 
 import (
@@ -35,7 +36,16 @@ var sensitive = map[string]struct{}{
 const (
 	updateSnapshotKey = "as:audit_update_snapshot"
 	deleteSnapshotKey = "as:audit_delete_snapshot"
+
+	// AuditLogsTable is never auto-audited, so a recorder that inserts into
+	// this table cannot recurse into its own callback.
+	AuditLogsTable = "audit_logs"
 )
+
+// Recorder persists the captured events. It is called synchronously with the
+// write's transaction handle; using that handle keeps the audit rows atomic
+// with the business write. Returning an error rolls the business write back.
+type Recorder func(tx *gorm.DB, events []map[string]any) error
 
 type snapshot struct {
 	profile    as.EventProfile
@@ -51,13 +61,16 @@ type snapshot struct {
 //     When it returns an EventProfile with an empty OperatorID the operation is
 //     silently skipped (no admin context = no audit row, PHP parity).
 //   - include is an optional table filter; nil allows every table.
-func Register(db *gorm.DB, client *as.Client, profile func(context.Context) as.EventProfile, include func(table string) bool) error {
+func Register(db *gorm.DB, recorder Recorder, profile func(context.Context) as.EventProfile, include func(table string) bool) error {
 	if db == nil {
 		return errors.New("auditgorm: nil db")
 	}
+	if recorder == nil {
+		return errors.New("auditgorm: nil recorder")
+	}
 	guard := func(tx *gorm.DB) (as.EventProfile, string, bool) {
 		table := statementTable(tx.Statement)
-		if table == "" || (include != nil && !include(table)) || profile == nil {
+		if table == "" || table == AuditLogsTable || (include != nil && !include(table)) || profile == nil {
 			return as.EventProfile{}, table, false
 		}
 		ctx := tx.Statement.Context
@@ -71,7 +84,10 @@ func Register(db *gorm.DB, client *as.Client, profile func(context.Context) as.E
 		return p, table, true
 	}
 
-	db.Callback().Create().After("gorm:create").Register("as:audit_create", func(tx *gorm.DB) {
+	// Register before the model's own after_* hook / commit, so a recorder
+	// error still rolls the business write back and the audit insert shares the
+	// same transaction.
+	db.Callback().Create().Before("gorm:after_create").Register("as:audit_create", func(tx *gorm.DB) {
 		if tx.Error != nil || tx.RowsAffected == 0 {
 			return
 		}
@@ -79,7 +95,7 @@ func Register(db *gorm.DB, client *as.Client, profile func(context.Context) as.E
 		if !ok {
 			return
 		}
-		emitCreate(client, p, table, tx)
+		emitCreate(recorder, p, table, tx)
 	})
 
 	db.Callback().Update().Before("gorm:before_update").Register("as:audit_update_before", func(tx *gorm.DB) {
@@ -89,11 +105,11 @@ func Register(db *gorm.DB, client *as.Client, profile func(context.Context) as.E
 		}
 		captureUpdate(tx, p, table)
 	})
-	db.Callback().Update().After("gorm:update").Register("as:audit_update_after", func(tx *gorm.DB) {
+	db.Callback().Update().Before("gorm:after_update").Register("as:audit_update_after", func(tx *gorm.DB) {
 		if tx.Error != nil || tx.RowsAffected == 0 {
 			return
 		}
-		emitUpdate(client, tx)
+		emitUpdate(recorder, tx)
 	})
 
 	db.Callback().Delete().Before("gorm:before_delete").Register("as:audit_delete_before", func(tx *gorm.DB) {
@@ -103,16 +119,16 @@ func Register(db *gorm.DB, client *as.Client, profile func(context.Context) as.E
 		}
 		captureDelete(tx, p, table)
 	})
-	db.Callback().Delete().After("gorm:delete").Register("as:audit_delete_after", func(tx *gorm.DB) {
+	db.Callback().Delete().Before("gorm:after_delete").Register("as:audit_delete_after", func(tx *gorm.DB) {
 		if tx.Error != nil || tx.RowsAffected == 0 {
 			return
 		}
-		emitDelete(client, tx)
+		emitDelete(recorder, tx)
 	})
 	return nil
 }
 
-func emitCreate(client *as.Client, p as.EventProfile, table string, tx *gorm.DB) {
+func emitCreate(recorder Recorder, p as.EventProfile, table string, tx *gorm.DB) {
 	stmt := tx.Statement
 	rv := deref(stmt.ReflectValue)
 	switch rv.Kind() {
@@ -121,7 +137,7 @@ func emitCreate(client *as.Client, p as.EventProfile, table string, tx *gorm.DB)
 		if len(after) == 0 {
 			return
 		}
-		sendAsync(client, []map[string]any{as.NewEvent(as.ActionCreate, p.Service, table, id, nil, after, p)})
+		record(recorder, tx, []map[string]any{as.NewEvent(as.ActionCreate, p.Service, table, id, nil, after, p)})
 	case reflect.Slice, reflect.Array:
 		if rv.Len() == 0 {
 			return
@@ -140,9 +156,9 @@ func emitCreate(client *as.Client, p as.EventProfile, table string, tx *gorm.DB)
 		}
 		switch {
 		case len(rows) == 1:
-			sendAsync(client, []map[string]any{as.NewEvent(as.ActionCreate, p.Service, table, id, nil, rows[0], p)})
+			record(recorder, tx, []map[string]any{as.NewEvent(as.ActionCreate, p.Service, table, id, nil, rows[0], p)})
 		case len(rows) > 1:
-			sendAsync(client, as.MergeInsertEvents(p.Service, table, rows, p))
+			record(recorder, tx, as.MergeInsertEvents(p.Service, table, rows, p))
 		}
 	}
 }
@@ -183,7 +199,7 @@ func captureDelete(tx *gorm.DB, p as.EventProfile, table string) {
 	tx.InstanceSet(deleteSnapshotKey, snap)
 }
 
-func emitUpdate(client *as.Client, tx *gorm.DB) {
+func emitUpdate(recorder Recorder, tx *gorm.DB) {
 	raw, ok := tx.InstanceGet(updateSnapshotKey)
 	if !ok {
 		return
@@ -203,7 +219,7 @@ func emitUpdate(client *as.Client, tx *gorm.DB) {
 			return
 		}
 		before := beforeFor(snap.before, changed)
-		sendAsync(client, []map[string]any{as.NewEvent(as.ActionUpdate, snap.profile.Service, snap.table, snap.instanceID, before, changed, snap.profile)})
+		record(recorder, tx, []map[string]any{as.NewEvent(as.ActionUpdate, snap.profile.Service, snap.table, snap.instanceID, before, changed, snap.profile)})
 		return
 	}
 
@@ -218,14 +234,14 @@ func emitUpdate(client *as.Client, tx *gorm.DB) {
 	switch {
 	case len(pairs) == 1:
 		for key, pair := range pairs {
-			sendAsync(client, []map[string]any{as.NewEvent(as.ActionUpdate, snap.profile.Service, snap.table, key, pair.Before, pair.After, snap.profile)})
+			record(recorder, tx, []map[string]any{as.NewEvent(as.ActionUpdate, snap.profile.Service, snap.table, key, pair.Before, pair.After, snap.profile)})
 		}
 	case len(pairs) > 1:
-		sendAsync(client, as.MergeUpdateEvents(snap.profile.Service, snap.table, pairs, snap.profile))
+		record(recorder, tx, as.MergeUpdateEvents(snap.profile.Service, snap.table, pairs, snap.profile))
 	}
 }
 
-func emitDelete(client *as.Client, tx *gorm.DB) {
+func emitDelete(recorder Recorder, tx *gorm.DB) {
 	raw, ok := tx.InstanceGet(deleteSnapshotKey)
 	if !ok {
 		return
@@ -236,7 +252,7 @@ func emitDelete(client *as.Client, tx *gorm.DB) {
 	}
 	if snap.instanceID != "" {
 		image := deleteKey(auditPayload(snap.before), snap.primaryKey)
-		sendAsync(client, []map[string]any{as.NewEvent(as.ActionDelete, snap.profile.Service, snap.table, snap.instanceID, image, nil, snap.profile)})
+		record(recorder, tx, []map[string]any{as.NewEvent(as.ActionDelete, snap.profile.Service, snap.table, snap.instanceID, image, nil, snap.profile)})
 		return
 	}
 
@@ -247,10 +263,10 @@ func emitDelete(client *as.Client, tx *gorm.DB) {
 	switch {
 	case len(images) == 1:
 		for key, image := range images {
-			sendAsync(client, []map[string]any{as.NewEvent(as.ActionDelete, snap.profile.Service, snap.table, key, image, nil, snap.profile)})
+			record(recorder, tx, []map[string]any{as.NewEvent(as.ActionDelete, snap.profile.Service, snap.table, key, image, nil, snap.profile)})
 		}
 	case len(images) > 1:
-		sendAsync(client, as.MergeDeleteEvents(snap.profile.Service, snap.table, images, snap.profile))
+		record(recorder, tx, as.MergeDeleteEvents(snap.profile.Service, snap.table, images, snap.profile))
 	}
 }
 
@@ -628,17 +644,11 @@ func normalizeValue(value any) any {
 	}
 }
 
-func sendAsync(client *as.Client, events []map[string]any) {
-	if client == nil || len(events) == 0 {
+func record(recorder Recorder, tx *gorm.DB, events []map[string]any) {
+	if recorder == nil || len(events) == 0 {
 		return
 	}
-	batch := make([]map[string]any, len(events))
-	for i := range events {
-		copied := map[string]any{}
-		for key, value := range events[i] {
-			copied[key] = value
-		}
-		batch[i] = copied
+	if err := recorder(tx, events); err != nil {
+		tx.AddError(fmt.Errorf("auditgorm: record events: %w", err))
 	}
-	go func() { _ = client.SyncBatch(batch) }()
 }

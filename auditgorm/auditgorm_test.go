@@ -3,8 +3,7 @@ package auditgorm
 import (
 	"context"
 	"encoding/json"
-	"net/http"
-	"net/http/httptest"
+	"errors"
 	"sync"
 	"testing"
 	"time"
@@ -15,57 +14,31 @@ import (
 	"gorm.io/gorm/logger"
 )
 
-// captured server that records {"events":[...]} envelopes.
-type eventsServer struct {
-	mu      sync.Mutex
-	batches [][]map[string]any
-	srv     *httptest.Server
+// eventSink captures the events the recorder receives. Recording is
+// synchronous, so tests can read it immediately after the write.
+type eventSink struct {
+	mu     sync.Mutex
+	events []map[string]any
+	err    error
 }
 
-func (e *eventsServer) all() []map[string]any {
+func (e *eventSink) record(_ *gorm.DB, events []map[string]any) error {
 	e.mu.Lock()
 	defer e.mu.Unlock()
-	var out []map[string]any
-	for _, b := range e.batches {
-		out = append(out, b...)
+	if e.err != nil {
+		return e.err
 	}
-	return out
+	e.events = append(e.events, events...)
+	return nil
 }
 
-func newEventsServer(t *testing.T) *eventsServer {
-	t.Helper()
-	e := &eventsServer{}
-	e.srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		var envelope struct {
-			Events []map[string]any `json:"events"`
-		}
-		if err := json.NewDecoder(r.Body).Decode(&envelope); err != nil {
-			w.WriteHeader(400)
-			return
-		}
-		e.mu.Lock()
-		e.batches = append(e.batches, envelope.Events)
-		e.mu.Unlock()
-		w.WriteHeader(202)
-		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`{"accepted":` + itoa(len(envelope.Events)) + `,"failed":0}`))
-	}))
-	t.Cleanup(e.srv.Close)
-	return e
+func (e *eventSink) all() []map[string]any {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return append([]map[string]any(nil), e.events...)
 }
 
-func itoa(n int) string {
-	d := "0123456789"
-	if n == 0 {
-		return "0"
-	}
-	var out []byte
-	for n > 0 {
-		out = append([]byte{d[n%10]}, out...)
-		n /= 10
-	}
-	return string(out)
-}
+func newEventSink() *eventSink { return &eventSink{} }
 
 type subject struct {
 	ID        uint64
@@ -76,7 +49,7 @@ type subject struct {
 
 func (subject) TableName() string { return "subjects" }
 
-func newAuditedDB(t *testing.T, e *eventsServer, include func(string) bool, operatorID string) *gorm.DB {
+func newAuditedDB(t *testing.T, e *eventSink, include func(string) bool, operatorID string) *gorm.DB {
 	t.Helper()
 	qdb, err := gorm.Open(sqlite.Open("file::memory:?mode=memory&cache=private"), &gorm.Config{
 		Logger: logger.Default.LogMode(logger.Silent),
@@ -100,32 +73,22 @@ func newAuditedDB(t *testing.T, e *eventsServer, include func(string) bool, oper
 			t.Fatalf("ddl %q: %v", ddl, err)
 		}
 	}
-	client := as.NewClient(as.ClientConfig{Address: e.srv.URL, AppID: "t", Secret: "s"})
 	profile := func(context.Context) as.EventProfile {
 		return as.EventProfile{Service: "parking", OperatorID: operatorID, OperatorName: "张三"}
 	}
-	if err = Register(qdb, client, profile, include); err != nil {
+	if err = Register(qdb, e.record, profile, include); err != nil {
 		t.Fatalf("register: %v", err)
 	}
 	return qdb
 }
 
-func waitDrained(t *testing.T, timeout time.Duration) {
-	t.Helper()
-	deadline := time.Now().Add(timeout)
-	for time.Now().Before(deadline) {
-		time.Sleep(20 * time.Millisecond)
-	}
-}
-
 func TestCreateCapturesFullAfterRow(t *testing.T) {
-	e := newEventsServer(t)
+	e := newEventSink()
 	qdb := newAuditedDB(t, e, nil, "9")
 
 	if err := qdb.Create(&subject{Title: strp("订单一"), State: strp("paid")}).Error; err != nil {
 		t.Fatalf("insert: %v", err)
 	}
-	waitDrained(t, 2*time.Second)
 
 	events := e.all()
 	if len(events) != 1 {
@@ -145,20 +108,18 @@ func TestCreateCapturesFullAfterRow(t *testing.T) {
 }
 
 func TestInstanceUpdateCapturesBeforeAndAfterOnce(t *testing.T) {
-	e := newEventsServer(t)
+	e := newEventSink()
 	qdb := newAuditedDB(t, e, nil, "9")
 	row := &subject{Title: strp("a"), State: strp("draft")}
 	if err := qdb.Create(row).Error; err != nil {
 		t.Fatal(err)
 	}
-	waitDrained(t, time.Second)
 	createEvents := len(e.all())
 
 	row.State = strp("refunded")
 	if err := qdb.Save(row).Error; err != nil {
 		t.Fatal(err)
 	}
-	waitDrained(t, 2*time.Second)
 
 	events := e.all()
 	if len(events) != createEvents+1 {
@@ -183,7 +144,7 @@ func TestInstanceUpdateCapturesBeforeAndAfterOnce(t *testing.T) {
 }
 
 func TestMassUpdateMergesIntoOneEvent(t *testing.T) {
-	e := newEventsServer(t)
+	e := newEventSink()
 	qdb := newAuditedDB(t, e, nil, "9")
 	for _, row := range []subject{
 		{Title: strp("outer"), State: strp("draft")},
@@ -193,11 +154,9 @@ func TestMassUpdateMergesIntoOneEvent(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	waitDrained(t, time.Second)
 	if err := qdb.Model(&subject{}).Where("state = ?", "draft").Update("state", "paid").Error; err != nil {
 		t.Fatal(err)
 	}
-	waitDrained(t, 2*time.Second)
 
 	var updates []map[string]any
 	for _, ev := range e.all() {
@@ -209,7 +168,7 @@ func TestMassUpdateMergesIntoOneEvent(t *testing.T) {
 		t.Fatalf("expected ONE merged update event, got %d", len(updates))
 	}
 	after := updates[0]["after"].(map[string]any)
-	if n, _ := after["count"].(float64); int(n) != 2 {
+	if n := intValue(after["count"]); n != 2 {
 		t.Errorf("count wrong: %+v", after)
 	}
 	if updates[0]["resource_id"] != "" {
@@ -218,19 +177,17 @@ func TestMassUpdateMergesIntoOneEvent(t *testing.T) {
 }
 
 func TestMassDeleteMergesImagesPerRow(t *testing.T) {
-	e := newEventsServer(t)
+	e := newEventSink()
 	qdb := newAuditedDB(t, e, nil, "9")
 	for i, title := range []string{"订单一", "订单二"} {
 		row := subject{ID: uint64(i + 1), Title: strp(title), State: strp("draft")}
 		insert(qdb, row)
 	}
 	updateState(qdb)
-	waitDrained(t, time.Second)
 
 	if err := qdb.Where("id IN (?,?)", 1, 2).Delete(&subject{}).Error; err != nil {
 		t.Fatal(err)
 	}
-	waitDrained(t, 2*time.Second)
 
 	var deletes []map[string]any
 	for _, ev := range e.all() {
@@ -257,17 +214,15 @@ func TestMassDeleteMergesImagesPerRow(t *testing.T) {
 }
 
 func TestInstanceDeleteCapturesImage(t *testing.T) {
-	e := newEventsServer(t)
+	e := newEventSink()
 	qdb := newAuditedDB(t, e, nil, "9")
 	row := &subject{Title: strp("订单一"), State: strp("paid")}
 	if err := qdb.Create(row).Error; err != nil {
 		t.Fatal(err)
 	}
-	waitDrained(t, time.Second)
 	if err := qdb.Delete(row).Error; err != nil {
 		t.Fatal(err)
 	}
-	waitDrained(t, 2*time.Second)
 
 	var deletes []map[string]any
 	for _, ev := range e.all() {
@@ -291,18 +246,16 @@ func TestInstanceDeleteCapturesImage(t *testing.T) {
 }
 
 func TestModelUpdatesMapCapturesOnlyChangedFields(t *testing.T) {
-	e := newEventsServer(t)
+	e := newEventSink()
 	qdb := newAuditedDB(t, e, nil, "9")
 	row := &subject{Title: strp("订单一"), State: strp("draft")}
 	if err := qdb.Create(row).Error; err != nil {
 		t.Fatal(err)
 	}
-	waitDrained(t, time.Second)
 
 	if err := qdb.Model(row).Updates(map[string]any{"state": "draft"}).Error; err != nil {
 		t.Fatal(err)
 	}
-	waitDrained(t, time.Second)
 	if updates := countAction(e.all(), "update"); updates != 0 {
 		t.Fatalf("no-op update must stay silent, got %d", updates)
 	}
@@ -310,7 +263,6 @@ func TestModelUpdatesMapCapturesOnlyChangedFields(t *testing.T) {
 	if err := qdb.Model(row).Updates(map[string]any{"state": "paid"}).Error; err != nil {
 		t.Fatal(err)
 	}
-	waitDrained(t, 2*time.Second)
 	var updates []map[string]any
 	for _, ev := range e.all() {
 		if ev["action"] == "update" {
@@ -330,18 +282,16 @@ func TestModelUpdatesMapCapturesOnlyChangedFields(t *testing.T) {
 }
 
 func TestStructUpdatesSkipsZeroFields(t *testing.T) {
-	e := newEventsServer(t)
+	e := newEventSink()
 	qdb := newAuditedDB(t, e, nil, "9")
 	row := &subject{Title: strp("订单一"), State: strp("draft")}
 	if err := qdb.Create(row).Error; err != nil {
 		t.Fatal(err)
 	}
-	waitDrained(t, time.Second)
 
 	if err := qdb.Model(row).Updates(&subject{State: strp("paid")}).Error; err != nil {
 		t.Fatal(err)
 	}
-	waitDrained(t, 2*time.Second)
 
 	var updates []map[string]any
 	for _, ev := range e.all() {
@@ -362,18 +312,16 @@ func TestStructUpdatesSkipsZeroFields(t *testing.T) {
 }
 
 func TestTableUpdatesMapCapturesRowsWithoutModelSchema(t *testing.T) {
-	e := newEventsServer(t)
+	e := newEventSink()
 	qdb := newAuditedDB(t, e, nil, "9")
 	row := &subject{Title: strp("订单一"), State: strp("draft")}
 	if err := qdb.Create(row).Error; err != nil {
 		t.Fatal(err)
 	}
-	waitDrained(t, time.Second)
 
 	if err := qdb.Table("subjects").Where("id = ?", row.ID).Updates(map[string]any{"state": "paid"}).Error; err != nil {
 		t.Fatal(err)
 	}
-	waitDrained(t, 2*time.Second)
 
 	var updates []map[string]any
 	for _, ev := range e.all() {
@@ -398,18 +346,16 @@ type statePatch struct {
 }
 
 func TestTableUpdatesPartialStructCapturesOnlyProvidedFields(t *testing.T) {
-	e := newEventsServer(t)
+	e := newEventSink()
 	qdb := newAuditedDB(t, e, nil, "9")
 	row := &subject{Title: strp("订单一"), State: strp("draft")}
 	if err := qdb.Create(row).Error; err != nil {
 		t.Fatal(err)
 	}
-	waitDrained(t, time.Second)
 
 	if err := qdb.Table("subjects").Where("id = ?", row.ID).Updates(&statePatch{State: strp("paid")}).Error; err != nil {
 		t.Fatal(err)
 	}
-	waitDrained(t, 2*time.Second)
 
 	var updates []map[string]any
 	for _, ev := range e.all() {
@@ -432,6 +378,18 @@ func TestTableUpdatesPartialStructCapturesOnlyProvidedFields(t *testing.T) {
 	}
 }
 
+func intValue(v any) int {
+	switch n := v.(type) {
+	case int:
+		return n
+	case int64:
+		return int(n)
+	case float64:
+		return int(n)
+	}
+	return 0
+}
+
 func countAction(events []map[string]any, action string) int {
 	n := 0
 	for _, ev := range events {
@@ -442,25 +400,41 @@ func countAction(events []map[string]any, action string) int {
 	return n
 }
 
+func TestRecorderErrorRollsBackWrite(t *testing.T) {
+	e := newEventSink()
+	e.err = errors.New("audit store down")
+	qdb := newAuditedDB(t, e, nil, "9")
+
+	if err := qdb.Create(&subject{Title: strp("订单一"), State: strp("paid")}).Error; err == nil {
+		t.Fatal("expected the recorder error to abort the create")
+	}
+
+	var count int64
+	if err := qdb.Model(&subject{}).Count(&count).Error; err != nil {
+		t.Fatal(err)
+	}
+	if count != 0 {
+		t.Fatalf("business row must be rolled back, got %d rows", count)
+	}
+}
+
 func TestEmptyOperatorProfileSkipsAuditing(t *testing.T) {
-	e := newEventsServer(t)
+	e := newEventSink()
 	qdb := newAuditedDB(t, e, nil, "")
 	if err := qdb.Create(&subject{Title: strp("订单一"), State: strp("paid")}).Error; err != nil {
 		t.Fatal(err)
 	}
-	waitDrained(t, 2*time.Second)
 	if len(e.all()) != 0 {
 		t.Errorf("expected silent skip without operator, got %d", len(e.all()))
 	}
 }
 
 func TestIncludeFilterBlocksTables(t *testing.T) {
-	e := newEventsServer(t)
+	e := newEventSink()
 	qdb := newAuditedDB(t, e, func(name string) bool { return false }, "9")
 	if err := qdb.Create(&subject{Title: strp("订单一"), State: strp("paid")}).Error; err != nil {
 		t.Fatal(err)
 	}
-	waitDrained(t, 2*time.Second)
 	if len(e.all()) != 0 {
 		t.Errorf("include(false) must silence everything")
 	}
